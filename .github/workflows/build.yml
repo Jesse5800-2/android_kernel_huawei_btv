@@ -12,53 +12,104 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. 使用完整Linaro工具链（包含binutils）
-      - name: Setup Toolchain
+      # 1. 设置完全隔离的工具链环境
+      - name: Setup Isolated Toolchain
         run: |
+          # 下载Linaro GCC 7.5（含binutils）
           wget -q https://releases.linaro.org/components/toolchain/binaries/7.5-2019.12/aarch64-linux-gnu/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu.tar.xz
           tar -xf gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu.tar.xz
-          echo "$(pwd)/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu/bin" >> $GITHUB_PATH
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export PATH=$(pwd)/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu/bin:$PATH
+          
+          # 创建隔离环境（覆盖系统默认路径）
+          echo "$(pwd)/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu/bin" > $GITHUB_PATH
+          echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
+          echo "ARCH=arm64" >> $GITHUB_ENV
           
           # 验证工具链
-          ${CROSS_COMPILE}gcc -v
-          ${CROSS_COMPILE}ld -v
+          aarch64-linux-gnu-gcc -v 2>&1 | grep "Linaro GCC 7.5"
 
-      # 2. 修复内核配置交互问题
-      - name: Prepare Kernel Config
+      # 2. 修复dtc冲突（必须在编译前执行）
+      - name: Patch DTC Issues
         run: |
-          export ARCH=arm64
-          # 非交互式生成配置
+          # 修复yylloc重复定义
+          sed -i 's/^yylloc/extern &/' scripts/dtc/dtc-lexer.lex.c
+          
+          # 防止mlittle-endian错误
+          find scripts -name Makefile* -exec sed -i 's/-mlittle-endian//g' {} +
+
+      # 3. 非交互式内核配置
+      - name: Configure Kernel
+        run: |
+          # 生成初始配置
           yes "" | make merge_hi3650_defconfig
           
-          # 强制启用关键配置
-          sed -i 's/# CONFIG_KPROBES is not set/CONFIG_KPROBES=y/' .config
-          sed -i 's/# CONFIG_OVERLAY_FS is not set/CONFIG_OVERLAY_FS=y/' .config
-          echo "CONFIG_KSU=y" >> .config
+          # 强制启用关键选项
+          cat << EOF >> .config
+          CONFIG_KPROBES=y
+          CONFIG_OVERLAY_FS=y
+          CONFIG_KSU=y
+          CONFIG_MODULES=y
+          EOF
           
-          # 非交互式确认配置
+          # 应用配置（非交互式）
           yes "" | make oldconfig
 
-      # 3. 修复scripts编译问题
-      - name: Fix Host Tools
+      # 4. 分阶段编译（关键步骤）
+      - name: Build Host Tools
         run: |
           # 使用系统gcc编译host工具
           unset CROSS_COMPILE
           make ARCH=arm64 scripts -j$(nproc)
-          export CROSS_COMPILE=aarch64-linux-gnu-
+          
+          # 单独编译dtc
+          make ARCH=arm64 scripts/dtc/dtc
 
-      # 4. 正式编译
+      # 5. 正式编译内核
       - name: Build Kernel
         run: |
-          export ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          make -j$(nproc) Image.gz-dtb 2>&1 | tee build.log
-          [ ! -f arch/arm64/boot/Image.gz-dtb ] && { echo "错误：未生成内核镜像"; exit 1; }
+          # 恢复交叉编译环境
+          source $GITHUB_ENV
+          
+          # 仅编译必要目标
+          make -j$(nproc) Image.gz-dtb modules 2>&1 | tee build.log
+          
+          # 验证产物
+          [ ! -f arch/arm64/boot/Image.gz-dtb ] && { echo "Error: Kernel image not found"; exit 1; }
 
+      # 6. 集成KernelSU
+      - name: Integrate KernelSU
+        run: |
+          export KERNELSU_TAG=v0.9.2
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+          
+          # 重新编译模块
+          make -j$(nproc) modules_prepare
+
+      # 7. 打包刷机包
+      - name: Package Kernel
+        run: |
+          git clone https://github.com/osm0sis/AnyKernel3
+          cp arch/arm64/boot/Image.gz-dtb AnyKernel3/
+          
+          # 华为M3专用配置
+          cat << EOF >> AnyKernel3/anykernel.sh
+          device.name1=btv-w09
+          device.name2=btv-dl09
+          block=/dev/block/platform/hi_mci.0/by-name/boot
+          do.devicecheck=1
+          EOF
+          
+          # 打包内核模块
+          mkdir -p AnyKernel3/modules
+          find . -name "*.ko" -exec cp {} AnyKernel3/modules/ \;
+          
+          cd AnyKernel3
+          zip -r9 ../kernel_kernelsu.zip *
+
+      # 8. 上传产物
       - uses: actions/upload-artifact@v4
         with:
-          name: kernel_artifacts
+          name: kernel_hi3650_${{ github.run_number }}
           path: |
-            arch/arm64/boot/Image.gz-dtb
+            kernel_kernelsu.zip
             build.log
+          retention-days: 3
