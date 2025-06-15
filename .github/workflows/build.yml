@@ -1,4 +1,4 @@
-name: Build Hi3650 Kernel with KernelSU
+name: Build Hi3650 Kernel with KernelSU (Isolated Toolchain)
 
 on:
   push:
@@ -12,46 +12,42 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. 安全设置工具链
-      - name: Setup Toolchain
+      # 1. 设置100%隔离的工具链环境
+      - name: Setup Isolated Toolchain
         run: |
-          # 下载工具链
-          wget -q https://releases.linaro.org/components/toolchain/binaries/7.5-2019.12/aarch64-linux-gnu/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu.tar.xz
+          # 下载Linaro GCC 7.5（含完整binutils）
+          wget -q https://mirrors.ustc.edu.cn/linaro-toolchain-binaries/7.5-2019.12/aarch64-linux-gnu/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu.tar.xz
           tar -xf gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu.tar.xz
           
-          # 安全添加PATH（追加而非覆盖）
-          echo "$(pwd)/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu/bin" >> $GITHUB_PATH
+          # 设置隔离环境变量（关键！）
+          echo "TOOLCHAIN_DIR=$(pwd)/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu" >> $GITHUB_ENV
+          echo """
+          export PATH=$TOOLCHAIN_DIR/bin:\$PATH
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CC=\$CROSS_COMPILE\gcc
+          export LD=\$CROSS_COMPILE\ld
+          export AR=\$CROSS_COMPILE\ar
+          export STRIP=\$CROSS_COMPILE\strip
+          """ >> $GITHUB_ENV
           
-          # 设置环境变量
-          echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
-          echo "ARCH=arm64" >> $GITHUB_ENV
+          # 屏蔽系统工具链（防止污染）
+          sudo find /usr/bin -name 'aarch64-linux-gnu-*' -delete
           
-          # 双重验证
-          ${CROSS_COMPILE}gcc --version || echo "工具链验证失败"
-          which ${CROSS_COMPILE}gcc
+          # 验证隔离
+          echo "当前工具链："
+          \$CROSS_COMPILE\gcc -v
+          echo "工具链路径："
+          which \$CROSS_COMPILE\gcc
 
-      # 后续步骤保持不变...
-      - name: Build Kernel
-        run: |
-          make merge_hi3650_defconfig
-          make -j$(nproc)
-
-      # 2. 修复dtc冲突（必须在编译前执行）
-      - name: Patch DTC Issues
-        run: |
-          # 修复yylloc重复定义
-          sed -i 's/^yylloc/extern &/' scripts/dtc/dtc-lexer.lex.c
-          
-          # 防止mlittle-endian错误
-          find scripts -name Makefile* -exec sed -i 's/-mlittle-endian//g' {} +
-
-      # 3. 非交互式内核配置
+      # 2. 修复内核配置（非交互式）
       - name: Configure Kernel
         run: |
-          # 生成初始配置
+          source $GITHUB_ENV
+          
+          # 生成配置（强制非交互）
           yes "" | make merge_hi3650_defconfig
           
-          # 强制启用关键选项
+          # 硬编码关键配置
           cat << EOF >> .config
           CONFIG_KPROBES=y
           CONFIG_OVERLAY_FS=y
@@ -59,50 +55,58 @@ jobs:
           CONFIG_MODULES=y
           EOF
           
-          # 应用配置（非交互式）
+          # 应用配置
           yes "" | make oldconfig
 
-      # 4. 分阶段编译（关键步骤）
+      # 3. 分阶段编译（关键隔离步骤）
       - name: Build Host Tools
         run: |
-          # 使用系统gcc编译host工具
-          unset CROSS_COMPILE
+          # 临时使用系统工具链编译host工具
+          OLD_PATH=$PATH
+          export PATH=/usr/bin:$PATH
+          unset CROSS_COMPILE CC LD AR STRIP
+          
           make ARCH=arm64 scripts -j$(nproc)
           
-          # 单独编译dtc
+          # 修复dtc冲突
+          sed -i 's/^yylloc/extern &/' scripts/dtc/dtc-lexer.lex.c
           make ARCH=arm64 scripts/dtc/dtc
+          
+          # 恢复隔离环境
+          export PATH=$OLD_PATH
+          source $GITHUB_ENV
 
-      # 5. 正式编译内核
+      # 4. 正式编译内核（完全隔离环境）
       - name: Build Kernel
         run: |
-          # 恢复交叉编译环境
           source $GITHUB_ENV
           
-          # 仅编译必要目标
-          make -j$(nproc) Image.gz-dtb modules 2>&1 | tee build.log
+          # 验证环境纯净性
+          echo "=== 编译环境验证 ==="
+          which \$CROSS_COMPILE\gcc
+          ! which aarch64-linux-gnu-gcc || exit 1
           
-          # 验证产物
-          [ ! -f arch/arm64/boot/Image.gz-dtb ] && { echo "Error: Kernel image not found"; exit 1; }
+          # 编译内核主体
+          make ARCH=arm64 -j$(nproc) Image.gz-dtb modules 2>&1 | tee build.log
+          [ ! -f arch/arm64/boot/Image.gz-dtb ] && { echo "内核镜像未生成"; exit 1; }
 
-      # 6. 集成KernelSU
+      # 5. 集成KernelSU
       - name: Integrate KernelSU
         run: |
+          source $GITHUB_ENV
           export KERNELSU_TAG=v0.9.2
           curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
-          
-          # 重新编译模块
-          make -j$(nproc) modules_prepare
+          make ARCH=arm64 -j$(nproc) modules_prepare
 
-      # 7. 打包刷机包
+      # 6. 安全打包
       - name: Package Kernel
         run: |
           git clone https://github.com/osm0sis/AnyKernel3
           cp arch/arm64/boot/Image.gz-dtb AnyKernel3/
           
-          # 华为M3专用配置
+          # 华为Hi3650专用配置
           cat << EOF >> AnyKernel3/anykernel.sh
-          device.name1=btv-w09
-          device.name2=btv-dl09
+          device.name1=hi3650
           block=/dev/block/platform/hi_mci.0/by-name/boot
           do.devicecheck=1
           EOF
@@ -114,7 +118,7 @@ jobs:
           cd AnyKernel3
           zip -r9 ../kernel_kernelsu.zip *
 
-      # 8. 上传产物
+      # 7. 上传产物
       - uses: actions/upload-artifact@v4
         with:
           name: kernel_hi3650_${{ github.run_number }}
