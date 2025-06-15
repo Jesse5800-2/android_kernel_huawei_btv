@@ -1,0 +1,40 @@
+name: Build Kernel with KernelSU  # 工作流名称（无冒号嵌套问题）
+
+on:  # 触发条件（注意缩进）
+  push:
+    branches: [ main ]  # 仅在 main 分支推送时触发
+  workflow_dispatch:    # 允许手动触发
+
+jobs:
+  build:
+    runs-on: ubuntu-latest  # 运行环境
+
+    steps:
+      # 1. 拉取代码
+      - uses: actions/checkout@v4
+
+      # 2. 安装 KernelSU
+      - name: Set up KernelSU
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+
+      # 3. 编译内核
+      - name: Build Kernel
+        run: |
+          export ARCH=arm64
+          make btv_defconfig
+          make -j$(nproc)
+
+      # 4. 打包内核
+      - name: Package Kernel
+        run: |
+          git clone https://github.com/osm0sis/AnyKernel3
+          cp arch/arm64/boot/Image.gz-dtb AnyKernel3/
+          cd AnyKernel3
+          zip -r9 kernel_kernelsu.zip *
+
+      # 5. 上传产物
+      - uses: actions/upload-artifact@v3
+        with:
+          name: kernel_kernelsu
+          path: AnyKernel3/kernel_kernelsu.zip
