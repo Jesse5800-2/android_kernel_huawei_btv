@@ -12,28 +12,53 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 1. 使用完整Linaro工具链（包含binutils）
       - name: Setup Toolchain
         run: |
           wget -q https://releases.linaro.org/components/toolchain/binaries/7.5-2019.12/aarch64-linux-gnu/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu.tar.xz
           tar -xf gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu.tar.xz
-          export PATH=$(pwd)/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu/bin:$PATH
+          echo "$(pwd)/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu/bin" >> $GITHUB_PATH
           export CROSS_COMPILE=aarch64-linux-gnu-
+          export PATH=$(pwd)/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu/bin:$PATH
+          
+          # 验证工具链
           ${CROSS_COMPILE}gcc -v
+          ${CROSS_COMPILE}ld -v
 
+      # 2. 修复内核配置交互问题
+      - name: Prepare Kernel Config
+        run: |
+          export ARCH=arm64
+          # 非交互式生成配置
+          yes "" | make merge_hi3650_defconfig
+          
+          # 强制启用关键配置
+          sed -i 's/# CONFIG_KPROBES is not set/CONFIG_KPROBES=y/' .config
+          sed -i 's/# CONFIG_OVERLAY_FS is not set/CONFIG_OVERLAY_FS=y/' .config
+          echo "CONFIG_KSU=y" >> .config
+          
+          # 非交互式确认配置
+          yes "" | make oldconfig
+
+      # 3. 修复scripts编译问题
+      - name: Fix Host Tools
+        run: |
+          # 使用系统gcc编译host工具
+          unset CROSS_COMPILE
+          make ARCH=arm64 scripts -j$(nproc)
+          export CROSS_COMPILE=aarch64-linux-gnu-
+
+      # 4. 正式编译
       - name: Build Kernel
         run: |
           export ARCH=arm64
-          make merge_hi3650_defconfig
-          
-          # 强制启用 KernelSU 所需配置
-          sed -i 's/# CONFIG_KPROBES is not set/CONFIG_KPROBES=y/' .config
-          sed -i 's/# CONFIG_OVERLAY_FS is not set/CONFIG_OVERLAY_FS=y/' .config
-          make oldconfig
-          
-          make -j$(nproc) 2>&1 | tee build.log
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          make -j$(nproc) Image.gz-dtb 2>&1 | tee build.log
           [ ! -f arch/arm64/boot/Image.gz-dtb ] && { echo "错误：未生成内核镜像"; exit 1; }
 
       - uses: actions/upload-artifact@v4
         with:
-          name: build_logs
-          path: build.log
+          name: kernel_artifacts
+          path: |
+            arch/arm64/boot/Image.gz-dtb
+            build.log
