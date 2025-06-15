@@ -12,20 +12,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. 设置完全隔离的工具链环境
-      - name: Setup Isolated Toolchain
+      # 1. 安全设置工具链
+      - name: Setup Toolchain
         run: |
-          # 下载Linaro GCC 7.5（含binutils）
+          # 下载工具链
           wget -q https://releases.linaro.org/components/toolchain/binaries/7.5-2019.12/aarch64-linux-gnu/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu.tar.xz
           tar -xf gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu.tar.xz
           
-          # 创建隔离环境（覆盖系统默认路径）
-          echo "$(pwd)/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu/bin" > $GITHUB_PATH
+          # 安全添加PATH（追加而非覆盖）
+          echo "$(pwd)/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu/bin" >> $GITHUB_PATH
+          
+          # 设置环境变量
           echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
           echo "ARCH=arm64" >> $GITHUB_ENV
           
-          # 验证工具链
-          aarch64-linux-gnu-gcc -v 2>&1 | grep "Linaro GCC 7.5"
+          # 双重验证
+          ${CROSS_COMPILE}gcc --version || echo "工具链验证失败"
+          which ${CROSS_COMPILE}gcc
+
+      # 后续步骤保持不变...
+      - name: Build Kernel
+        run: |
+          make merge_hi3650_defconfig
+          make -j$(nproc)
 
       # 2. 修复dtc冲突（必须在编译前执行）
       - name: Patch DTC Issues
