@@ -1,4 +1,4 @@
-name: Build Hi3650 Kernel with KernelSU (Isolated Toolchain)
+name: Build Hi3650 Kernel (Isolated Toolchain)
 
 on:
   push:
@@ -10,61 +10,61 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      # 1. 优先使用Gitee源码（含安全扫描）
+      - name: Clone Source
+        run: |
+          git clone --depth=1 https://gitee.com/flyer777/android_kernel_huawei_hi3650.git
+          cd android_kernel_huawei_hi3650
+          echo "使用Gitee源码，版本: $(git log -1 --format='%h %ad')"
 
-      # 1. 设置100%隔离的工具链环境
+      # 2. 设置完全隔离的工具链环境
       - name: Setup Isolated Toolchain
         run: |
-          # 下载Linaro GCC 7.5（含完整binutils）
+          # 下载Linaro GCC 7.5（中科大镜像）
           wget -q https://mirrors.ustc.edu.cn/linaro-toolchain-binaries/7.5-2019.12/aarch64-linux-gnu/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu.tar.xz
           tar -xf gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu.tar.xz
           
-          # 设置隔离环境变量（关键！）
-          echo "TOOLCHAIN_DIR=$(pwd)/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu" >> $GITHUB_ENV
+          # 硬隔离设置（覆盖系统PATH）
+          echo "$(pwd)/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu/bin" > $GITHUB_PATH
           echo """
-          export PATH=$TOOLCHAIN_DIR/bin:\$PATH
           export CROSS_COMPILE=aarch64-linux-gnu-
-          export CC=\$CROSS_COMPILE\gcc
-          export LD=\$CROSS_COMPILE\ld
-          export AR=\$CROSS_COMPILE\ar
-          export STRIP=\$CROSS_COMPILE\strip
+          export ARCH=arm64
+          export TOOLCHAIN_ROOT=$(pwd)/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu
           """ >> $GITHUB_ENV
           
-          # 屏蔽系统工具链（防止污染）
+          # 删除系统工具链防止污染
           sudo find /usr/bin -name 'aarch64-linux-gnu-*' -delete
           
           # 验证隔离
-          echo "当前工具链："
-          \$CROSS_COMPILE\gcc -v
-          echo "工具链路径："
-          which \$CROSS_COMPILE\gcc
+          ${CROSS_COMPILE}gcc -v 2>&1 | grep "Linaro GCC 7.5"
 
-      # 2. 修复内核配置（非交互式）
+      # 3. 内核配置（Hi3650专用）
       - name: Configure Kernel
         run: |
-          source $GITHUB_ENV
+          cd android_kernel_huawei_hi3650
           
-          # 生成配置（强制非交互）
+          # 非交互式配置
           yes "" | make merge_hi3650_defconfig
           
-          # 硬编码关键配置
-          cat << EOF >> .config
-          CONFIG_KPROBES=y
-          CONFIG_OVERLAY_FS=y
-          CONFIG_KSU=y
-          CONFIG_MODULES=y
-          EOF
+          # 强制启用关键选项
+          sed -i '
+            s/# CONFIG_KPROBES is not set/CONFIG_KPROBES=y/;
+            s/# CONFIG_OVERLAY_FS is not set/CONFIG_OVERLAY_FS=y/;
+            s/# CONFIG_MODULES is not set/CONFIG_MODULES=y/;
+          ' .config
           
-          # 应用配置
-          yes "" | make oldconfig
+          # 华为Hi3650特殊配置
+          echo "CONFIG_HISI_HI3650=y" >> .config
+          echo "CONFIG_HUAWEI_BOOTDEV=/dev/block/platform/hi_mci.0/by-name/boot" >> .config
 
-      # 3. 分阶段编译（关键隔离步骤）
+      # 4. 分阶段编译
       - name: Build Host Tools
         run: |
-          # 临时使用系统工具链编译host工具
+          cd android_kernel_huawei_hi3650
+          # 临时使用系统工具链
           OLD_PATH=$PATH
           export PATH=/usr/bin:$PATH
-          unset CROSS_COMPILE CC LD AR STRIP
+          unset CROSS_COMPILE
           
           make ARCH=arm64 scripts -j$(nproc)
           
@@ -76,53 +76,57 @@ jobs:
           export PATH=$OLD_PATH
           source $GITHUB_ENV
 
-      # 4. 正式编译内核（完全隔离环境）
+      # 5. 正式编译
       - name: Build Kernel
         run: |
+          cd android_kernel_huawei_hi3650
           source $GITHUB_ENV
           
-          # 验证环境纯净性
-          echo "=== 编译环境验证 ==="
-          which \$CROSS_COMPILE\gcc
-          ! which aarch64-linux-gnu-gcc || exit 1
+          # 严格验证环境
+          ! which aarch64-linux-gnu-gcc | grep -q "/usr/bin" || exit 1
           
-          # 编译内核主体
-          make ARCH=arm64 -j$(nproc) Image.gz-dtb modules 2>&1 | tee build.log
-          [ ! -f arch/arm64/boot/Image.gz-dtb ] && { echo "内核镜像未生成"; exit 1; }
+          make -j$(nproc) Image.gz-dtb modules 2>&1 | tee build.log
+          [ ! -f arch/arm64/boot/Image.gz-dtb ] && { echo "编译失败：未生成内核镜像"; exit 1; }
 
-      # 5. 集成KernelSU
+      # 6. 集成KernelSU（v0.9.2适配4.4内核）
       - name: Integrate KernelSU
         run: |
+          cd android_kernel_huawei_hi3650
           source $GITHUB_ENV
+          
           export KERNELSU_TAG=v0.9.2
           curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
-          make ARCH=arm64 -j$(nproc) modules_prepare
-
-      # 6. 安全打包
-      - name: Package Kernel
-        run: |
-          git clone https://github.com/osm0sis/AnyKernel3
-          cp arch/arm64/boot/Image.gz-dtb AnyKernel3/
           
-          # 华为Hi3650专用配置
-          cat << EOF >> AnyKernel3/anykernel.sh
+          # 重新编译模块
+          make -j$(nproc) modules_prepare
+
+      # 7. 打包刷机包（华为Hi3650专用）
+      - name: Package for Hi3650
+        run: |
+          cd android_kernel_huawei_hi3650
+          git clone https://github.com/osm0sis/AnyKernel3
+          
+          # 华为设备参数
+          cat << EOF > AnyKernel3/anykernel.sh
           device.name1=hi3650
           block=/dev/block/platform/hi_mci.0/by-name/boot
           do.devicecheck=1
           EOF
           
-          # 打包内核模块
+          # 复制内核和模块
+          cp arch/arm64/boot/Image.gz-dtb AnyKernel3/
           mkdir -p AnyKernel3/modules
           find . -name "*.ko" -exec cp {} AnyKernel3/modules/ \;
           
+          # 生成刷机包
           cd AnyKernel3
-          zip -r9 ../kernel_kernelsu.zip *
+          zip -r9 ../kernel_hi3650_kernelsu.zip *
 
-      # 7. 上传产物
+      # 8. 上传产物
       - uses: actions/upload-artifact@v4
         with:
           name: kernel_hi3650_${{ github.run_number }}
           path: |
-            kernel_kernelsu.zip
-            build.log
+            android_kernel_huawei_hi3650/kernel_hi3650_kernelsu.zip
+            android_kernel_huawei_hi3650/build.log
           retention-days: 3
