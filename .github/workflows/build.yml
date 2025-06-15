@@ -1,31 +1,29 @@
-name: Build Kernel with KernelSU  # 工作流名称（无冒号嵌套问题）
+name: Build Kernel with KernelSU
 
-on:  # 触发条件（注意缩进）
+on:
   push:
-    branches: [ main ]  # 仅在 main 分支推送时触发
-  workflow_dispatch:    # 允许手动触发
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-latest  # 运行环境
+    runs-on: ubuntu-latest
 
     steps:
-      # 1. 拉取代码
       - uses: actions/checkout@v4
 
-      # 2. 安装 KernelSU
       - name: Set up KernelSU
         run: |
           curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
 
-      # 3. 编译内核
       - name: Build Kernel
         run: |
           export ARCH=arm64
           make btv_defconfig
           make -j$(nproc)
 
-      # 4. 打包内核
       - name: Package Kernel
         run: |
           git clone https://github.com/osm0sis/AnyKernel3
@@ -33,8 +31,8 @@ jobs:
           cd AnyKernel3
           zip -r9 kernel_kernelsu.zip *
 
-      # 5. 上传产物
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4  # 关键修改：升级到v4
         with:
           name: kernel_kernelsu
           path: AnyKernel3/kernel_kernelsu.zip
+          retention-days: 1  # 可选：设置产物保留时间
